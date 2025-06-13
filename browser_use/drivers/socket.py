@@ -1,6 +1,9 @@
 import asyncio
 import logging
 import uuid
+import time
+import random
+import string
 from typing import Any, Literal, Awaitable
 
 import socketio
@@ -21,10 +24,17 @@ from browser_use.typing import (
 
 logger = logging.getLogger(__name__)
 
+# Generate a unique Python client ID
+def generate_python_client_id():
+    timestamp = int(time.time() * 1000)
+    random_suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=9))
+    return f"python_{timestamp}_{random_suffix}"
+
 # Helper for request/response pattern over socket.io
 class SocketRequestManager:
-    def __init__(self, sio: socketio.AsyncClient):
+    def __init__(self, sio: socketio.AsyncClient, browser_client_id: str):
         self.sio = sio
+        self._browser_client_id = browser_client_id
         self._futures = {}
         self.sio.on('response', self._on_response)
 
@@ -32,10 +42,26 @@ class SocketRequestManager:
         req_id = str(uuid.uuid4())
         fut = asyncio.get_event_loop().create_future()
         self._futures[req_id] = fut
-        await self.sio.emit(event, {**data, 'req_id': req_id})
+        
+        # Add browser client routing information if available
+        emit_data = {**data, 'req_id': req_id}
+        if self._browser_client_id:
+            emit_data['target_browser_client_id'] = self._browser_client_id
+            # Route through browser_command event for proper routing
+            await self.sio.emit('browser_command', {
+                'browser_client_id': self._browser_client_id,
+                'command': event,
+                'data': emit_data
+            })
+        else:
+            # Direct emission for backwards compatibility
+            await self.sio.emit(event, emit_data)
+        
         return await fut
 
     def _on_response(self, data):
+        if data.get('browser_client_id') != self._browser_client_id:
+            return
         logger.debug(f"Received response: {data}")
         req_id = data.get('req_id')
         if req_id and req_id in self._futures:
@@ -47,8 +73,12 @@ class SocketBrowser(AbstractBrowser):
     def __init__(self, config: BrowserConfig):
         super().__init__()
         self._config = config
-        self._sio = socketio.AsyncClient(logger=True, engineio_logger=True)
-        self._req = SocketRequestManager(self._sio)
+        self._python_client_id = generate_python_client_id()
+        self._sio = socketio.AsyncClient(
+            logger=True, 
+            engineio_logger=True
+        )
+        self._req = SocketRequestManager(self._sio, self._config.browser_client_id)
         self._contexts = []
         self._version = None
 
@@ -56,8 +86,23 @@ class SocketBrowser(AbstractBrowser):
         url = self._config.wss_url or self._config.cdp_url
         if not url:
             raise ValueError('SocketBrowser requires wss_url or cdp_url for socket.io endpoint')
-        logger.info(f"Connecting to {url}")
-        await self._sio.connect(url, transports=['websocket'])
+        logger.info(f"Connecting to {url} as Python client: {self._python_client_id}")
+        
+        try:
+            # Try connecting with auth data as a parameter
+            auth_data = {
+                'clientType': 'python',
+                'clientId': self._python_client_id
+            }
+            await self._sio.connect(url, transports=['websocket'], auth=auth_data)
+        except TypeError:
+            # Fallback: connect without auth and send auth data separately
+            await self._sio.connect(url, transports=['websocket'])
+            await self._sio.emit('client_auth', {
+                'clientType': 'python',
+                'clientId': self._python_client_id
+            })
+        
         self._version = await self._req.emit('get_version', {})
         logger.info(f"Browser version: {self._version}")
         return self
@@ -70,8 +115,9 @@ class SocketBrowser(AbstractBrowser):
         await self._sio.disconnect()
 
     async def new_context(self, **kwargs):
-        ctx_id = await self._req.emit('new_context', kwargs)
-        ctx = SocketContext(self._req, ctx_id)
+        response = await self._req.emit('new_context', kwargs)
+        pages = [SocketPage(self._req, page['id']) for page in response['pages']]
+        ctx = SocketContext(self._req, response['contextId'], pages)
         self._contexts.append(ctx)
         return ctx
 
@@ -83,12 +129,20 @@ class SocketBrowser(AbstractBrowser):
     def version(self) -> str:
         return self._version or ''
 
+    @property
+    def python_client_id(self) -> str:
+        return self._python_client_id
+
+    def set_target_browser_client(self, browser_client_id: str):
+        """Set the target browser client for routing requests."""
+        self._req.set_target_browser_client(browser_client_id)
+
 
 class SocketContext(AbstractContext):
-    def __init__(self, req: SocketRequestManager, ctx_id: str):
+    def __init__(self, req: SocketRequestManager, ctx_id: str, pages: list):
         self._req = req
         self._ctx_id = ctx_id
-        self._pages = []
+        self._pages = pages
 
     async def new_page(self):
         page_id = await self._req.emit('new_page', {'context_id': self._ctx_id})
@@ -364,31 +418,57 @@ class SocketElementHandle(AbstractElementHandle):
         self._page_id = page_id
 
     async def is_visible(self) -> bool:
-        return await self._req.emit('element_is_visible', {'element_id': self._el_id})
+        return await self._req.emit('element_is_visible', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+        })
 
     async def is_hidden(self) -> bool:
-        return await self._req.emit('element_is_hidden', {'element_id': self._el_id})
+        return await self._req.emit('element_is_hidden', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+        })
 
     async def bounding_box(self) -> dict | None:
-        return await self._req.emit('element_bounding_box', {'element_id': self._el_id})
+        return await self._req.emit('element_bounding_box', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+        })
 
     async def scroll_into_view_if_needed(self, timeout: int | float | None = None) -> None:
-        await self._req.emit('element_scroll_into_view_if_needed', {'element_id': self._el_id, 'timeout': timeout})
+        await self._req.emit('element_scroll_into_view_if_needed', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'timeout': timeout
+        })
 
     async def element_handle(self) -> 'SocketElementHandle':
         return self
 
     async def wait_for_element_state(self, state: Literal['disabled', 'editable', 'enabled', 'hidden', 'stable', 'visible'], timeout: int | float | None = None) -> None:
-        await self._req.emit('element_wait_for_element_state', {'element_id': self._el_id, 'state': state, 'timeout': timeout})
+        await self._req.emit('element_wait_for_element_state', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'state': state,
+            'timeout': timeout
+        })
 
     async def query_selector(self, selector: str) -> 'SocketElementHandle | None':
-        el_id = await self._req.emit('element_query_selector', {'element_id': self._el_id, 'selector': selector})
+        el_id = await self._req.emit('element_query_selector', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'selector': selector
+        })
         if not el_id:
             return None
         return SocketElementHandle(self._req, el_id, self._page_id)
 
     async def query_selector_all(self, selector: str) -> list['SocketElementHandle']:
-        el_ids = await self._req.emit('element_query_selector_all', {'element_id': self._el_id, 'selector': selector})
+        el_ids = await self._req.emit('element_query_selector_all', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'selector': selector
+        })
         return [SocketElementHandle(self._req, eid, self._page_id) for eid in el_ids]
 
     def on(self, event: str, handler) -> None:
@@ -406,21 +486,45 @@ class SocketElementHandle(AbstractElementHandle):
         })
 
     async def get_property(self, property_name: str):
-        return await self._req.emit('element_get_property', {'element_id': self._el_id, 'property_name': property_name})
+        return await self._req.emit('element_get_property', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'property_name': property_name
+        })
 
     async def evaluate(self, script: str, *args, **kwargs):
-        result = await self._req.emit('element_evaluate', {'element_id': self._el_id, 'script': script, 'args': args, 'kwargs': kwargs})
+        result = await self._req.emit('element_evaluate', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'script': script,
+            'args': args,
+            'kwargs': kwargs
+        })
         logger.debug(f"Evaluate result: {result}")
         return result
 
     async def type(self, text: str, delay: float = 0) -> None:
-        await self._req.emit('element_type', {'element_id': self._el_id, 'text': text, 'delay': delay})
+        await self._req.emit('element_type', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'text': text,
+            'delay': delay
+        })
 
     async def fill(self, text: str, timeout: float | None = None) -> None:
-        await self._req.emit('element_fill', {'element_id': self._el_id, 'text': text, 'timeout': timeout})
+        await self._req.emit('element_fill', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'text': text,
+            'timeout': timeout
+        })
 
     async def clear(self, timeout: float | None = None) -> None:
-        await self._req.emit('element_clear', {'element_id': self._el_id, 'timeout': timeout})
+        await self._req.emit('element_clear', {
+            'element_id': self._el_id,
+            'page_id': self._page_id,
+            'timeout': timeout
+        })
 
 
 class SocketLocator(AbstractLocator):
